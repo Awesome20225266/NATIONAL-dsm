@@ -1,0 +1,16 @@
+requests
+tqdm
+rapidfuzz
+selenium
+webdriver-manager
+dash
+dash-bootstrap-components
+dash-mantine-components
+pandas
+numpy
+plotly
+duckdb
+boto3
+gunicorn
+openpyxl
+xlsxwriter
