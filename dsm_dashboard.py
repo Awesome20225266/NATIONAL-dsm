@@ -773,9 +773,104 @@ from datetime import datetime, timedelta
 
 _DUCKDB_DIR = Path(__file__).resolve().parent
 
+# ---------------------------------------------------------------------------
+# AWS S3 helpers — download regional DuckDB files for Render deployment.
+# Secrets are read from environment variables (set on Render dashboard or
+# loaded from a local .env file via python-dotenv).  Never printed.
+# ---------------------------------------------------------------------------
+
+_DSM_S3_KEY_MAP: dict[str, str] = {
+    "nrpc": "S3_KEY_NRPC",
+    "srpc": "S3_KEY_SRPC",
+    "wrpc": "S3_KEY_WRPC",
+}
+
+
+def _get_secret(name: str) -> str | None:
+    """Read a secret from environment variables. Never prints the value."""
+    v = os.environ.get(name)
+    return v if v and v.strip() else None
+
+
+def _get_s3_key_for_region(region_lower: str) -> str:
+    """
+    Return the S3 object key for a DSM region.
+    Reads from S3_KEY_NRPC / S3_KEY_SRPC / S3_KEY_WRPC env vars.
+    Raises RuntimeError if the secret is missing.
+    """
+    secret_name = _DSM_S3_KEY_MAP.get(region_lower.strip().lower())
+    if not secret_name:
+        raise ValueError(f"Unknown DSM region '{region_lower}'. Allowed: {list(_DSM_S3_KEY_MAP)}")
+    s3_key = _get_secret(secret_name)
+    if not s3_key:
+        raise RuntimeError(
+            f"Missing env var '{secret_name}' required to download '{region_lower}.duckdb' from S3. "
+            "Set it in the Render environment variables (or .env for local runs)."
+        )
+    return s3_key
+
+
+def _ensure_region_db_local(region_lower: str) -> Path:
+    """
+    Ensure the regional DuckDB file exists locally.
+    Downloads from S3 if the file is absent (e.g. fresh Render container).
+    Returns the local Path.  Read credentials come from env vars.
+    """
+    local_path = _DUCKDB_DIR / f"{region_lower.strip().lower()}.duckdb"
+
+    if local_path.exists() and local_path.stat().st_size > 0:
+        return local_path  # already present — fast path
+
+    aws_access_key_id     = _get_secret("AWS_ACCESS_KEY_ID")
+    aws_secret_access_key = _get_secret("AWS_SECRET_ACCESS_KEY")
+    aws_region            = _get_secret("AWS_REGION")
+    s3_bucket             = _get_secret("S3_BUCKET")
+
+    missing = [k for k, v in {
+        "AWS_ACCESS_KEY_ID":     aws_access_key_id,
+        "AWS_SECRET_ACCESS_KEY": aws_secret_access_key,
+        "AWS_REGION":            aws_region,
+        "S3_BUCKET":             s3_bucket,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(
+            f"Cannot download '{region_lower}.duckdb' — missing env vars: {', '.join(missing)}. "
+            "Set them in the Render environment variables (or .env for local runs)."
+        )
+
+    s3_key = _get_s3_key_for_region(region_lower)
+
+    import boto3  # type: ignore
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=aws_region,
+    )
+
+    tmp_path = local_path.with_suffix(".duckdb.tmp")
+    try:
+        print(f"[dsm_dashboard] Downloading {region_lower}.duckdb from S3 ...", flush=True)
+        s3.download_file(s3_bucket, s3_key, str(tmp_path))
+        os.replace(str(tmp_path), str(local_path))
+        print(f"[dsm_dashboard] {region_lower}.duckdb ready.", flush=True)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+    return local_path
+
+
 def _duckdb_path(region_lower: str) -> Path:
-    """Resolve DuckDB file path relative to this script (robust to cwd)."""
-    return _DUCKDB_DIR / f"{str(region_lower).lower()}.duckdb"
+    """
+    Resolve DuckDB file path for a region, downloading from S3 if not present locally.
+    All existing duckdb.connect() calls go through this — no other changes needed.
+    """
+    return _ensure_region_db_local(str(region_lower).lower())
 
 def _norm_plant_name(name: str) -> str:
     try:
